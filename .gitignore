@@ -1,0 +1,8 @@
+.idea
+bin
+obj
+TestRun
+Build.linux-x64
+Build.win-x64
+warp-packer
+.directory
