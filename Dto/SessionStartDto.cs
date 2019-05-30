@@ -11,5 +11,7 @@ namespace BimZipClient.Dto
         public int ProcessTaskTimeoutMs { get; set; }
         public int ProcessTaskIntervalMs { get; set; }
         public int ForgeDownloadTimeoutMs { get; set; }
+
+        public string AccessToken { get; set; }
     }
 }

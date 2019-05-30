@@ -4,11 +4,13 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Threading;
 using System.Threading.Tasks;
 using BimZipClient.Dto;
+using Newtonsoft.Json;
 using Serilog.Core;
 using Tiny.RestClient;
 
@@ -28,10 +30,17 @@ namespace BimZipClient.Infrastructure
         private readonly ConcurrentQueue<FileDto> _taskQueue = new ConcurrentQueue<FileDto>();
         private readonly ConcurrentQueue<ReportDto> _reportQueue = new ConcurrentQueue<ReportDto>();
 
+        private readonly System.Timers.Timer _timer = new System.Timers.Timer
+        {
+            Interval = 60000 * 15,
+            Enabled = true,
+            AutoReset = true,
+        };
+
         public Manager(ClientConfig config)
         {
             _config = config;
-            _log = Log.Create("manager");
+            _log = Log.Create("manager", config.BackupPath);
             _restClient = new TinyRestClient(new HttpClient(), _config.BaseEndpoint);
             _restClient.Settings.Formatters.OfType<JsonFormatter>().First().UseCamelCase();
             _restClient.Settings.DefaultTimeout = TimeSpan.FromSeconds(120);
@@ -47,6 +56,7 @@ namespace BimZipClient.Infrastructure
                     _downloadTaskStopwatch.Restart();
                     return true;
                 }
+
                 return false;
             }
         }
@@ -67,17 +77,34 @@ namespace BimZipClient.Infrastructure
             }
 
             _config.SetSession(response);
+            _config.ForgeToken = response.AccessToken;
+
+            _timer.Elapsed += async (sender, args) =>
+            {
+                try
+                {
+                    var tokenRequest = _restClient.GetRequest($"token/{_config.ClientId}");
+                    var tokenResponse = await tokenRequest.ExecuteAsync<TokenDto>();
+                    _config.ForgeToken = tokenResponse.AccessToken;
+                    _log.Information("Token refresh ok");
+                }
+                catch (Exception e)
+                {
+                    _log.Error(e, "Token refresh error: ");
+                }
+            };
+            _timer.Start();
 
             _tasks.Add(Task.Run(async () => await PullData())
                 .ContinueWith(x => _log.Information("Puller exit")));
-            
+
             _tasks.Add(Task.Run(async () => await PushData())
                 .ContinueWith(x => _log.Information("Pusher exit")));
-            
+
             _tasks.AddRange(Enumerable.Range(0, _config.Concurrency)
                 .Select(i => ProcessData(i + 1)
                     .ContinueWith(x => _log.Information($"Worker {i + 1} exit"))));
-            
+
             _log.Information("Session started, workers: " + _config.Concurrency);
             Task.WaitAll(_tasks.ToArray());
             _log.Information("BimZip BimZipClient shutdown");
@@ -96,7 +123,6 @@ namespace BimZipClient.Infrastructure
                 try
                 {
                     var r = await request.ExecuteAsync<TaskDto>();
-                    _config.ForgeToken = r.AccessToken;
 
                     if (r.FileList.Any())
                     {
@@ -129,6 +155,7 @@ namespace BimZipClient.Infrastructure
                         default:
                             throw new Exception("Unknown server command");
                     }
+
                     serverErrorCount = 0;
                     serverError500Count = 0;
                 }
@@ -137,8 +164,8 @@ namespace BimZipClient.Infrastructure
                     serverError500Count++;
                     _log.Error(
                         $"puller: server status: {ex.StatusCode} " +
-                        $"try {serverError500Count} of 20");
-                    if (serverError500Count >= 20)
+                        $"try {serverError500Count} of 200");
+                    if (serverError500Count >= 200)
                     {
                         _log.Error("puller: server is dead, shutting down");
                         _running = false;
@@ -157,6 +184,7 @@ namespace BimZipClient.Infrastructure
                         return;
                     }
                 }
+
                 await Task.Delay(
                     TimeSpan.FromMilliseconds(Math.Max(0, _config.PullTaskTimeoutMs - st.Elapsed.TotalMilliseconds)));
             }
@@ -171,7 +199,7 @@ namespace BimZipClient.Infrastructure
             while (_running || _taskQueue.Any())
             {
                 sTotal.Restart();
-                if (_taskQueue.TryDequeue(out var fd) == false)
+                if (_taskQueue.TryDequeue(out var task) == false)
                 {
                     try
                     {
@@ -186,8 +214,7 @@ namespace BimZipClient.Infrastructure
 
                 if (CanStartDownloadTask() == false)
                 {
-                    //_log.Verbose("CanStartDownloadTask = false");
-                    _taskQueue.Enqueue(fd);
+                    _taskQueue.Enqueue(task);
                     try
                     {
                         await Task.Delay(TimeSpan.FromMilliseconds(500), _cts.Token);
@@ -201,44 +228,85 @@ namespace BimZipClient.Infrastructure
 
                 var report = new ReportDto
                 {
-                    Id = fd.Id,
+                    Id = task.Id,
                     Size = 0,
                     Success = false,
                     Message = string.Empty,
                     DownloadTimeMs = 0
                 };
+                var fileInfo = new FileInfo(Path.Combine(_config.BackupPath.FullName, Utils.CreatePath(task.Path)));
 
                 try
                 {
-                    var fileInfo = new FileInfo(Path.Combine(_config.BackupPath.FullName, Utils.CreatePath(fd.Path)));
                     // ReSharper disable once PossibleNullReferenceException
                     fileInfo.Directory.Create();
-                    var downloadPath = fileInfo.FullName + ".bimzip";
-                    using (var fileStream = File.Open(downloadPath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.None))
-                    using (var httpClient = GetClient())
+                    var downloadFileInfo = new FileInfo(fileInfo.FullName + ".bimzip");
+                    var timer = new System.Timers.Timer
                     {
-                        sDownload.Restart();
-                        using (var stream = await httpClient.GetStreamAsync(new Uri(fd.Url)))
+                        Interval = 10000,
+                        AutoReset = true,
+                        Enabled = true
+                    };
+                    sDownload.Restart();
+                    var progressData = new CopyProgressInfo();
+                    using (var fileStream = File.Open(downloadFileInfo.FullName, FileMode.OpenOrCreate,
+                        FileAccess.Write,
+                        FileShare.None))
+                    using (var httpClient = GetClient())
+                    using (var stream = await httpClient.GetStreamAsync(new Uri(task.Url)))
+                    using (timer)
+                    {
+                        timer.Elapsed += (sender, args) =>
                         {
-                            await stream.CopyToAsync(fileStream, _cts.Token);
-                        }
+                            _log.Information(
+                                $"worker #{id}: downloading {fileInfo.Name} {progressData.BytesTransfered / (1024 * 1024)} MB");
+                        };
+                        await stream.CopyToAsyncProgress(fileStream, 1024, progressData, _cts.Token);
                     }
-                    File.Move(downloadPath, fileInfo.FullName);
 
+                    Debug.Assert(downloadFileInfo.Exists);
+                    downloadFileInfo.MoveTo(fileInfo.FullName);
                     report.Size = fileInfo.Length;
                     report.Success = true;
                     report.DownloadTimeMs = sDownload.ElapsedMilliseconds;
+                    _reportQueue.Enqueue(report);
                     _log.Information(
                         $"worker #{id}: {fileInfo.Name} " +
                         $"downloaded {((double) report.Size / 1024 / 1024):F2}MB " +
                         $"in {sDownload.Elapsed.TotalSeconds:F} seconds");
                 }
+                catch (HttpException e)
+                {
+                    if (e.StatusCode >= (HttpStatusCode) 400)
+                    {
+                        _log.Error($"Autodesk server returned error {e.StatusCode} for {fileInfo.Name}, requeue");
+                        _taskQueue.Enqueue(task);
+                    }
+                    else
+                    {
+                        _log.Error($"Autodesk server returned error {e.StatusCode}for {fileInfo.Name}, skipping file");
+                        report.Message = e.Message;
+                        _reportQueue.Enqueue(report);
+                    }
+                }
+                catch (HttpRequestException e)
+                {
+                    if (e.Message == "Resource temporarily unavailable")
+                    {
+                        _log.Error($"Autodesk server temporarily unavailable for {fileInfo.Name}, requeue");
+                        _taskQueue.Enqueue(task);
+                    }
+                    else
+                    {
+                        _log.Error($"Autodesk server returned error for {fileInfo.Name}, skipping file", e);
+                        report.Message = e.Message;
+                        _reportQueue.Enqueue(report);
+                    }
+                }
                 catch (Exception e)
                 {
+                    _log.Error($"Error occured while downloading {fileInfo.Name}", e);
                     report.Message = e.Message;
-                }
-                finally
-                {
                     _reportQueue.Enqueue(report);
                 }
 
@@ -253,6 +321,7 @@ namespace BimZipClient.Infrastructure
                     break;
                 }
             }
+
             Interlocked.Decrement(ref _workerCounter);
         }
 
@@ -295,6 +364,7 @@ namespace BimZipClient.Infrastructure
                         return;
                     }
                 }
+
                 try
                 {
                     var request = _restClient.PostRequest(
@@ -306,6 +376,7 @@ namespace BimZipClient.Infrastructure
                 {
                     _log.Error(e, "pusher: server reporting error");
                 }
+
                 try
                 {
                     await Task.Delay(
@@ -318,5 +389,11 @@ namespace BimZipClient.Infrastructure
                 }
             }
         }
+    }
+
+    public class TokenDto
+    {
+        [JsonProperty(Required = Required.Always)]
+        public string AccessToken { get; set; }
     }
 }
