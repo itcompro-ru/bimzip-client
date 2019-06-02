@@ -10,7 +10,6 @@ using System.Net.Http.Headers;
 using System.Threading;
 using System.Threading.Tasks;
 using BimZipClient.Dto;
-using Newtonsoft.Json;
 using Serilog.Core;
 using Tiny.RestClient;
 
@@ -241,29 +240,25 @@ namespace BimZipClient.Infrastructure
                     // ReSharper disable once PossibleNullReferenceException
                     fileInfo.Directory.Create();
                     var downloadFileInfo = new FileInfo(fileInfo.FullName + ".bimzip");
-                    var timer = new System.Timers.Timer
-                    {
-                        Interval = 10000,
-                        AutoReset = true,
-                        Enabled = true
-                    };
                     sDownload.Restart();
-                    var progressData = new CopyProgressInfo();
-                    using (var fileStream = File.Open(downloadFileInfo.FullName, FileMode.OpenOrCreate,
-                        FileAccess.Write,
-                        FileShare.None))
-                    using (var httpClient = GetClient())
-                    using (var stream = await httpClient.GetStreamAsync(new Uri(task.Url)))
-                    using (timer)
+                    
+                    var client = new HttpClientProgressReport(_config, TimeSpan.FromSeconds(10));
+                    client.ProgressChanged += (size, downloaded) =>
                     {
-                        timer.Elapsed += (sender, args) =>
+                        var message = $"worker #{id}: downloading {fileInfo.Name} ";
+                        if (size.HasValue)
                         {
-                            _log.Information(
-                                $"worker #{id}: downloading {fileInfo.Name} {progressData.BytesTransfered / (1024 * 1024)} MB");
-                        };
-                        await stream.CopyToAsyncProgress(fileStream, 1024, progressData, _cts.Token);
-                    }
-
+                            var progressPercentage = Math.Round((double) downloaded / size.Value * 100, 2);
+                            message += $"{progressPercentage}% ({((double) downloaded / (1024 * 1024)):F2}/{((double) size / (1024 * 1024)):F2} MB)";
+                        }
+                        else
+                        {
+                            message += $"{(downloaded / (1024 * 1024)):F2} MB";
+                        }
+                        _log.Information(message);
+                    };
+                    await client.DownloadAsync(task.Url, downloadFileInfo.FullName, _cts.Token);
+                    
                     Debug.Assert(downloadFileInfo.Exists);
                     downloadFileInfo.MoveTo(fileInfo.FullName);
                     report.Size = fileInfo.Length;
@@ -272,7 +267,7 @@ namespace BimZipClient.Infrastructure
                     _reportQueue.Enqueue(report);
                     _log.Information(
                         $"worker #{id}: {fileInfo.Name} " +
-                        $"downloaded {((double) report.Size / 1024 / 1024):F2}MB " +
+                        $"download complete {((double) report.Size / 1024 / 1024):F2}MB " +
                         $"in {sDownload.Elapsed.TotalSeconds:F} seconds");
                 }
                 catch (HttpException e)
@@ -325,21 +320,6 @@ namespace BimZipClient.Infrastructure
             Interlocked.Decrement(ref _workerCounter);
         }
 
-        private HttpClient GetClient()
-        {
-            var httpClient = new HttpClient(new HttpClientHandler()
-            {
-                ServerCertificateCustomValidationCallback =
-                    HttpClientHandler.DangerousAcceptAnyServerCertificateValidator
-            })
-            {
-                Timeout = TimeSpan.FromMilliseconds(_config.ForgeDownloadTimeoutMs)
-            };
-            httpClient.DefaultRequestHeaders.Authorization =
-                new AuthenticationHeaderValue("Bearer", _config.ForgeToken);
-            return httpClient;
-        }
-
         private async Task PushData()
         {
             var st = new Stopwatch();
@@ -389,11 +369,5 @@ namespace BimZipClient.Infrastructure
                 }
             }
         }
-    }
-
-    public class TokenDto
-    {
-        [JsonProperty(Required = Required.Always)]
-        public string AccessToken { get; set; }
     }
 }
