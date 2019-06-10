@@ -24,6 +24,8 @@ namespace BimZipClient.Infrastructure
         private readonly CancellationTokenSource _cts = new CancellationTokenSource();
         private volatile bool _running = true;
         private long _workerCounter;
+        private long _totalPulls;
+        private long _totalPushes;
         private readonly Stopwatch _downloadTaskStopwatch = new Stopwatch();
         private readonly object _downloadTaskLockObject = new object();
         private readonly ConcurrentQueue<FileDto> _taskQueue = new ConcurrentQueue<FileDto>();
@@ -123,10 +125,7 @@ namespace BimZipClient.Infrastructure
                 {
                     var r = await request.ExecuteAsync<TaskDto>();
 
-                    if (r.FileList.Any())
-                    {
-                        _log.Information($"puller: added tasks: {r.FileList.Count}");
-                    }
+                   
 
                     if (r.CommandCode > 0)
                     {
@@ -154,7 +153,11 @@ namespace BimZipClient.Infrastructure
                         default:
                             throw new Exception("Unknown server command");
                     }
-
+                    if (r.FileList.Any())
+                    {
+                        Interlocked.Add(ref _totalPulls, r.FileList.Count);
+                        _log.Information($"puller: added tasks: {r.FileList.Count} (total: {_totalPulls})");
+                    }
                     serverErrorCount = 0;
                     serverError500Count = 0;
                 }
@@ -350,7 +353,8 @@ namespace BimZipClient.Infrastructure
                     var request = _restClient.PostRequest(
                         $"reports/{_config.ClientId}/{_config.SessionKey}", list);
                     await request.ExecuteAsync<TaskDto>();
-                    _log.Information($"pusher: reports pushed: {list.Count} ");
+                    Interlocked.Add(ref _totalPushes, list.Count);
+                    _log.Information($"pusher: reports pushed: {list.Count} (total: {_totalPushes})");
                 }
                 catch (Exception e)
                 {
